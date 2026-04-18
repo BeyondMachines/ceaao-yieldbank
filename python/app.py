@@ -2,13 +2,15 @@
 Main Flask application for Banking Security Training
 Initializes the Flask app with all necessary components
 """
-from flask import Flask, request
+from flask import Flask, request, session
 from flask_login import LoginManager
 from flask_migrate import Migrate
 from config import Config
-from models import db, init_database, User
+from models import db, User
 import os
+import time
 from dotenv import load_dotenv
+from sqlalchemy.exc import SQLAlchemyError
 
 from application.errors import register_error_handlers
 from application.home import index, dashboard
@@ -19,6 +21,30 @@ from application.feedback import feedback_list, feedback_detail, submit_feedback
 from application.ai import ai_loan_advisor, ai_transaction_research
 # Load environment variables
 load_dotenv()
+
+
+def _initialize_schema_with_retry(app, attempts=10, delay_seconds=2):
+    """
+    Ensure core tables exist even when running plain `docker compose up`
+    without an explicit migration/init step.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            with app.app_context():
+                db.create_all()
+            app.logger.info("Database schema initialization check completed.")
+            return
+        except SQLAlchemyError as exc:
+            if attempt == attempts:
+                app.logger.error("Database schema initialization failed after retries: %s", exc)
+                raise
+            app.logger.warning(
+                "Database not ready for schema init (attempt %s/%s): %s",
+                attempt,
+                attempts,
+                exc,
+            )
+            time.sleep(delay_seconds)
 
 
 def create_app(config_class=Config):
@@ -72,8 +98,14 @@ def create_app(config_class=Config):
     @app.context_processor
     def inject_config():
         """Make config available in all templates"""
+        standard_prefs = session.get('standard_preferences', {}) or {}
+        custom_config = session.get('custom_config', {}) or {}
+        preferred_theme = standard_prefs.get('theme') or custom_config.get('theme') or 'auto'
+        if preferred_theme not in {'light', 'dark', 'auto'}:
+            preferred_theme = 'auto'
         return dict(
-            BANK_NAME=app.config['BANK_NAME']
+            BANK_NAME=app.config['BANK_NAME'],
+            UI_THEME=preferred_theme
         )
 
     @app.after_request
@@ -124,7 +156,11 @@ def create_app(config_class=Config):
     # Create api routes
     app.add_url_rule('/api/stats', 'api_stats', api_stats)
     app.add_url_rule('/api/transactions', 'api_transactions', api_transactions, methods=['POST'])
-        
+
+    auto_init_db = os.getenv("AUTO_INIT_DB", "true").lower() in {"1", "true", "yes"}
+    if auto_init_db:
+        _initialize_schema_with_retry(app)
+
     return app
 
 
